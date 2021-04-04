@@ -36,13 +36,15 @@ class TaskQueue {
             return task_taken_promise;
         }
 
-        void start() {
+        void set_start() {
             task_taken_promise->store(true, std::memory_order_acquire);
         }
 
         virtual void execute() = 0;
 
         virtual ~TaskBase() = default;
+
+        friend class TaskQueue;
     };
 
     template<typename ReturnType>
@@ -65,8 +67,7 @@ class TaskQueue {
                     function();
                     res_promise.set_value();
                 } catch (...) {
-                    res_promise.set_value();
-                    throw;
+                    res_promise.set_exception(std::current_exception());
                 }
             } else {
                 try {
@@ -105,8 +106,7 @@ class TaskQueue {
 
     public:
 
-        HandlerBase(HandlerBase &&other) noexcept : task_taken_future(std::move(other.task_taken_future)),
-                                           priority(other.priority) {}
+        HandlerBase(HandlerBase &&other) noexcept = default;
 
         HandlerBase &operator=(HandlerBase &&other) noexcept = default;
 
@@ -119,6 +119,8 @@ class TaskQueue {
         }
 
         virtual ~HandlerBase() = default;
+
+        friend class TaskQueue;
     };
 
     static void sleep() {
@@ -152,8 +154,8 @@ class TaskQueue {
                 elem = std::move(task_queue.queues[priority].front());
                 task_queue.queues[priority].pop_front();
                 (*task_queue.sizes[priority])--;
+                elem->set_start();
                 task_queue.total_elements--;
-                elem->start();
             }
             elem->execute();
         } else {
@@ -197,8 +199,21 @@ public:
         friend class TaskQueue;
     };
 
+private:
+
+    template<typename ReturnType>
+    static void check_expired(Handler<ReturnType> &handler, std::string const &function) {
+        if (handler.expired)
+            throw std::runtime_error("Operation on invalid handler: " + function);
+    }
+
+public:
+    explicit TaskQueue(uint32_t thread_count) : sizes(gen_counters()),
+                                                pool([this]() { thread_run(*this); }, thread_count) {
+    }
+
     template<typename Function>
-    auto enqueue(Function function, size_t priority) {
+    auto enqueue(Function function, size_t priority = queue_size - 1) {
         using ReturnType = decltype(function());
         assert(priority < queue_size);
         auto task = std::unique_ptr<TaskBase>(new Task<ReturnType>(function, priority));
@@ -206,19 +221,17 @@ public:
         {
             std::scoped_lock<std::mutex> queue_lock(queues_mutexes[priority]);
             queues[priority].push_back(std::move(task));
-            (*sizes[priority])++;
             handler.iterator = queues[priority].end();
             handler.iterator--;
-            total_elements++;
+            (*sizes[priority])++;
         }
-        return std::move(handler);
+        total_elements++;
+        return handler;
     }
 
     template<typename ReturnType>
     ReturnType execute(Handler<ReturnType> &handler) {
-        if (handler.expired) {
-            throw std::runtime_error("Execute on expired handler");
-        }
+        check_expired(handler, "execute");
         handler.expired = true;
         size_t priority = handler.get_priority();
         if (handler.started()) {
@@ -228,21 +241,65 @@ public:
         std::unique_ptr<TaskBase> task;
         {
             std::scoped_lock<std::mutex> queue_lock(queues_mutexes[priority]);
-            if (!handler.started()) {
-                task = std::move(*handler.iterator);
-                queues[priority].erase(handler.iterator);
-                (*sizes[priority])--;
-                task->start();
-                total_elements--;
-            } else {
+            if (handler.started()) {
                 return handler.get_result();
             }
+            task = std::move(*handler.iterator);
+            queues[priority].erase(handler.iterator);
+            task->set_start();
+            (*sizes[priority])--;
         }
+        total_elements--;
         return ((Task<ReturnType> *) task.get())->function();
     }
 
-    explicit TaskQueue(uint32_t thread_count) : sizes(gen_counters()),
-                                                pool([this]() { thread_run(*this); }, thread_count) {
+    template<typename ReturnType>
+    void set_priority(Handler<ReturnType> &handler, uint32_t new_priority) {
+        check_expired(handler, "set_priority");
+        size_t priority = handler.get_priority();
+        if (handler.started() || priority == new_priority) {
+            return;
+        }
+        {
+            std::lock(queues_mutexes[priority], queues_mutexes[new_priority]);
+            std::scoped_lock<std::mutex> queue_lock_from(std::adopt_lock, queues_mutexes[priority]);
+            std::scoped_lock<std::mutex> queue_lock_to(std::adopt_lock, queues_mutexes[new_priority]);
+            if (handler.started()) {
+                return;
+            }
+            auto task = std::move(*handler.iterator);
+            queues[priority].erase(handler.iterator);
+            task->priority = new_priority;
+            queues[new_priority].push_back(std::move(task));
+            handler.iterator = queues[new_priority].end();
+            handler.iterator--;
+            (*sizes[new_priority])++;
+            (*sizes[priority])--;
+        }
+        handler.priority = new_priority;
+    }
+
+    template<typename ReturnType>
+    void delete_task(Handler<ReturnType> &handler) {
+        check_expired(handler, "delete_task");
+        handler.expired = true;
+        if (handler.started()) {
+            return;
+        }
+        size_t priority = handler.get_priority();
+        {
+            std::scoped_lock<std::mutex> queue_lock(queues_mutexes[priority]);
+            if (handler.started()) {
+                return;
+            }
+            queues[priority].erase(handler.ite rator);
+        }
+        (*sizes[priority])--;
+        total_elements--;
+    }
+
+    bool empty() {
+        return total_elements == 0;
     }
 
     TaskQueue(TaskQueue const &) = delete;
