@@ -3,59 +3,53 @@
 //
 #pragma once
 
-#include <array>
+#include "PoolDispatcher.h"
+#include "QueueDistribution.h"
+
 #include <cassert>
-#include <cstddef>
 #include <future>
 #include <list>
 #include <memory>
 #include <mutex>
-
-#include "PoolDispatcher.h"
-#include "QueueDistribution.h"
 
 template<size_t queue_size = 8>
 class TaskQueue {
 
     static_assert(queue_size >= 1);
 
-    struct TaskBase {
+    class TaskBase {
     protected:
         std::shared_ptr<std::atomic_bool> task_taken_promise;
-        size_t priority;
 
-        explicit TaskBase(size_t priority) : priority(priority),
-                                             task_taken_promise(std::make_shared<std::atomic_bool>(false)) {}
+        explicit TaskBase() : task_taken_promise(std::make_shared<std::atomic_bool>(false)) {}
 
     public:
-        size_t get_priority() {
-            return priority;
-        }
 
         std::shared_ptr<std::atomic_bool> get_task_taken_future() {
             return task_taken_promise;
         }
 
         void set_start() {
-            task_taken_promise->store(true, std::memory_order_acquire);
+            task_taken_promise->store(true, std::memory_order_release);
         }
 
         virtual void execute() = 0;
 
         virtual ~TaskBase() = default;
-
-        friend class TaskQueue;
     };
 
     template<typename ReturnType>
-    struct Task final : TaskBase {
-
-        Task(std::function<ReturnType()> function, size_t priority) : TaskBase(priority),
-                                                                      function(std::move(function)) {}
+    class Task final : TaskBase {
+    public:
+        Task(std::function<ReturnType()> function) : function(std::move(function)) {}
 
         Task(Task const &) = delete;
 
+        Task &operator=(Task const &) = delete;
+
         Task(Task &&) noexcept = default;
+
+        Task &operator=(Task &&) noexcept = default;
 
         std::future<ReturnType> get_res_future() {
             return res_promise.get_future();
@@ -67,7 +61,12 @@ class TaskQueue {
                     function();
                     res_promise.set_value();
                 } catch (...) {
-                    res_promise.set_exception(std::current_exception());
+                    try {
+                        res_promise.set_exception(std::current_exception());
+                    } catch (...) {
+                        std::cerr << "Promise thrown" << std::endl;
+                        exit(1);
+                    }
                 }
             } else {
                 try {
@@ -92,44 +91,16 @@ class TaskQueue {
 
     using internal_queue_t = std::list<std::unique_ptr<TaskBase>>;
 
-    struct HandlerBase {
-    protected:
-
-        HandlerBase() = default;
-
-        std::shared_ptr<std::atomic_bool> task_taken_future;
-        size_t priority{};
-
-        explicit HandlerBase(size_t priority,
-                             std::shared_ptr<std::atomic_bool> task_taken) : priority(priority),
-                                                                             task_taken_future(std::move(task_taken)) {}
-
-    public:
-
-        HandlerBase(HandlerBase &&other) noexcept = default;
-
-        HandlerBase &operator=(HandlerBase &&other) noexcept = default;
-
-        [[nodiscard]] size_t get_priority() const {
-            return priority;
+    static void sleep(uint8_t &sleep_count) {
+        sleep_count = std::max(sleep_count + 1, 127);
+        if (sleep_count > 10) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50 * sleep_count));
         }
-
-        [[nodiscard]] bool started() const {
-            return task_taken_future->load();
-        }
-
-        virtual ~HandlerBase() = default;
-
-        friend class TaskQueue;
-    };
-
-    static void sleep() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    static void thread_run(TaskQueue &task_queue) {
+    static void thread_run(TaskQueue &task_queue, uint8_t &sleep_counter) {
         if (task_queue.total_elements.load() == 0) {
-            sleep();
+            sleep(sleep_counter);
             return;
         }
         size_t priority = QueueDistribution<queue_size>::generate();
@@ -140,10 +111,10 @@ class TaskQueue {
         }
 
         if (task_queue.total_elements.load() == 0) {
-            sleep();
+            sleep(sleep_counter);
             return;
         }
-
+        sleep_counter = 0;
         if ((*task_queue.sizes[priority]) != 0) {
             std::unique_ptr<TaskBase> elem;
             {
@@ -151,15 +122,13 @@ class TaskQueue {
                 if (*task_queue.sizes[priority] == 0) {
                     return;
                 }
-                elem = std::move(task_queue.queues[priority].front());
-                task_queue.queues[priority].pop_front();
+                elem = std::move(task_queue.queues[priority].back());
+                task_queue.queues[priority].pop_back();
                 (*task_queue.sizes[priority])--;
                 elem->set_start();
-                task_queue.total_elements--;
             }
+            task_queue.total_elements--;
             elem->execute();
-        } else {
-            sleep();
         }
     }
 
@@ -173,17 +142,20 @@ class TaskQueue {
 
 public:
     template<typename ReturnType>
-    struct Handler final : HandlerBase {
+    struct Handler {
 
         Handler() : expired(true) {
         }
 
-        explicit Handler(Task<ReturnType> &task) : HandlerBase(task.get_priority(), task.get_task_taken_future()),
-                                                   res_future(task.get_res_future()) {}
+        explicit Handler(Task<ReturnType> &task, uint32_t priority) : task_taken_future(task.get_task_taken_future()),
+                                                                      priority(priority),
+                                                                      res_future(task.get_res_future()) {}
 
         Handler(Handler const &) = delete;
 
         Handler(Handler &&) noexcept = default;
+
+        Handler &operator=(Handler const &other) = delete;
 
         Handler &operator=(Handler &&other) noexcept = default;
 
@@ -191,10 +163,21 @@ public:
             return res_future.get();
         }
 
+        [[nodiscard]] size_t get_priority() const {
+            return priority;
+        }
+
+        [[nodiscard]] bool is_started() const {
+            return task_taken_future->load(std::memory_order_acquire);
+        }
+
     private:
-        std::future<ReturnType> res_future;
         typename internal_queue_t::iterator iterator;
+        std::shared_ptr<std::atomic_bool> task_taken_future;
+        size_t priority{};
+        std::future<ReturnType> res_future;
         bool expired{false};
+
 
         friend class TaskQueue;
     };
@@ -208,21 +191,23 @@ private:
     }
 
 public:
-    explicit TaskQueue(uint32_t thread_count) : sizes(gen_counters()),
-                                                pool([this]() { thread_run(*this); }, thread_count) {
+    explicit TaskQueue(uint32_t thread_count) : sleep_counter(thread_count, 0), sizes(gen_counters()),
+                                                pool([this](PoolDispatcher::thread_id_t t_id) {
+                                                    thread_run(*this, sleep_counter[t_id]);
+                                                }, thread_count) {
     }
 
     template<typename Function>
     auto enqueue(Function function, size_t priority = queue_size - 1) {
         using ReturnType = decltype(function());
+        using Task_t = Task<ReturnType>;
         assert(priority < queue_size);
-        auto task = std::unique_ptr<TaskBase>(new Task<ReturnType>(function, priority));
-        Handler<ReturnType> handler(*((Task<ReturnType> *) task.get()));
+        auto task = std::unique_ptr<TaskBase>(new Task_t(std::move(function)));
+        Handler<ReturnType> handler(static_cast<Task_t &>(*task), priority);
         {
             std::scoped_lock<std::mutex> queue_lock(queues_mutexes[priority]);
-            queues[priority].push_back(std::move(task));
-            handler.iterator = queues[priority].end();
-            handler.iterator--;
+            queues[priority].push_front(std::move(task));
+            handler.iterator = queues[priority].begin();
             (*sizes[priority])++;
         }
         total_elements++;
@@ -234,15 +219,16 @@ public:
         check_expired(handler, "execute");
         handler.expired = true;
         size_t priority = handler.get_priority();
-        if (handler.started()) {
+        if (handler.is_started()) {
+            wait_result:
             return handler.get_result();
         }
 
         std::unique_ptr<TaskBase> task;
         {
             std::scoped_lock<std::mutex> queue_lock(queues_mutexes[priority]);
-            if (handler.started()) {
-                return handler.get_result();
+            if (handler.is_started()) {
+                goto wait_result;
             }
             task = std::move(*handler.iterator);
             queues[priority].erase(handler.iterator);
@@ -257,22 +243,20 @@ public:
     void set_priority(Handler<ReturnType> &handler, uint32_t new_priority) {
         check_expired(handler, "set_priority");
         size_t priority = handler.get_priority();
-        if (handler.started() || priority == new_priority) {
+        if (handler.is_started() || priority == new_priority) {
             return;
         }
         {
             std::lock(queues_mutexes[priority], queues_mutexes[new_priority]);
             std::scoped_lock<std::mutex> queue_lock_from(std::adopt_lock, queues_mutexes[priority]);
             std::scoped_lock<std::mutex> queue_lock_to(std::adopt_lock, queues_mutexes[new_priority]);
-            if (handler.started()) {
+            if (handler.is_started()) {
                 return;
             }
             auto task = std::move(*handler.iterator);
             queues[priority].erase(handler.iterator);
-            task->priority = new_priority;
-            queues[new_priority].push_back(std::move(task));
-            handler.iterator = queues[new_priority].end();
-            handler.iterator--;
+            queues[new_priority].push_front(std::move(task));
+            handler.iterator = queues[new_priority].begin();
             (*sizes[new_priority])++;
             (*sizes[priority])--;
         }
@@ -283,18 +267,18 @@ public:
     void delete_task(Handler<ReturnType> &handler) {
         check_expired(handler, "delete_task");
         handler.expired = true;
-        if (handler.started()) {
+        if (handler.is_started()) {
             return;
         }
         size_t priority = handler.get_priority();
         {
             std::scoped_lock<std::mutex> queue_lock(queues_mutexes[priority]);
-            if (handler.started()) {
+            if (handler.is_started()) {
                 return;
             }
-            queues[priority].erase(handler.ite rator);
+            queues[priority].erase(handler.iterator);
+            (*sizes[priority])--;
         }
-        (*sizes[priority])--;
         total_elements--;
     }
 
@@ -309,6 +293,7 @@ public:
 private:
     std::atomic_size_t total_elements{};
     std::array<internal_queue_t, queue_size> queues;
+    std::vector<uint8_t> sleep_counter;
     std::array<std::unique_ptr<std::atomic_size_t>, queue_size> sizes;
     std::array<std::mutex, queue_size> queues_mutexes;
     PoolDispatcher pool;
