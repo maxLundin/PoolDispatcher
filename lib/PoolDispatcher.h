@@ -11,36 +11,45 @@
 #include <vector>
 
 class PoolDispatcher {
-public:
-    using thread_id_t = int32_t;
 private:
-    template<typename Runnable>
-    struct thread_run {
-
-        explicit thread_run(Runnable &run) : runnable(new Runnable(run)) {}
-
-        void operator()(std::atomic_bool const &cancellation, thread_id_t t_id) {
-            while (!cancellation.load(std::memory_order_acquire)) {
-                (*runnable)(t_id);
+    void joinThreads() {
+        std::runtime_error *curError = nullptr;
+        for (auto &thread : threads) {
+            try {
+                thread.join();
+            } catch (std::system_error &error) {
+                curError = &error;
             }
         }
-
-    private:
-        std::unique_ptr<Runnable> runnable;
-    };
+        if (curError) {
+            throw *curError;
+        }
+    }
 
 public:
+    using thread_id_t = int32_t;
 
     template<typename Runnable>
-    explicit PoolDispatcher(Runnable run, thread_id_t threads_c) {
+    explicit
+    PoolDispatcher(Runnable run, thread_id_t threads_c) : canceller(std::make_unique<std::atomic_bool>(false)) {
         if (!threads_c) {
             throw std::runtime_error("Can't have 0 threads");
         }
         threads.reserve(threads_c);
-        cancellers.reserve(threads_c);
+
+        auto const runnable = [run](std::atomic_bool const &cancellation) {
+            while (!cancellation.load(std::memory_order_acquire)) {
+                run();
+            }
+        };
+
         for (thread_id_t i = 0; i < threads_c; ++i) {
-            cancellers.push_back(std::make_unique<std::atomic_bool>(false));
-            threads.emplace_back(thread_run(run), std::ref(*cancellers[i]), i);
+            try {
+                threads.emplace_back(runnable, std::ref(*canceller));
+            } catch (std::system_error &error) {
+                joinThreads();
+                throw;
+            }
         }
     }
 
@@ -49,17 +58,13 @@ public:
     PoolDispatcher(PoolDispatcher &&) = default;
 
     ~PoolDispatcher() {
-        for (auto &canceller : cancellers) {
-            canceller->store(true, std::memory_order_release);
-        }
-        for (auto &thread : threads) {
-            thread.join();
-        }
+        canceller->store(true, std::memory_order_release);
+        joinThreads();
     }
 
 private:
     std::vector<std::thread> threads;
-    std::vector<std::unique_ptr<std::atomic_bool>> cancellers;
+    std::unique_ptr<std::atomic_bool> canceller;
 };
 
 

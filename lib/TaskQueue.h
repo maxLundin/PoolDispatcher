@@ -56,28 +56,18 @@ class TaskQueue {
         }
 
         void execute() final {
-            if constexpr (std::is_same_v<ReturnType, void>) {
-                try {
+            try {
+                if constexpr (std::is_same_v<ReturnType, void>) {
                     function();
                     res_promise.set_value();
-                } catch (...) {
-                    try {
-                        res_promise.set_exception(std::current_exception());
-                    } catch (...) {
-                        std::cerr << "Promise thrown" << std::endl;
-                        exit(1);
-                    }
-                }
-            } else {
-                try {
+                } else {
                     res_promise.set_value(function());
+                }
+            } catch (...) {
+                try {
+                    res_promise.set_exception(std::current_exception());
                 } catch (...) {
-                    try {
-                        res_promise.set_exception(std::current_exception());
-                    } catch (...) {
-                        std::cerr << "Promise thrown" << std::endl;
-                        exit(1);
-                    }
+                    std::cerr << "Promise thrown" << std::endl;
                 }
             }
         }
@@ -91,30 +81,23 @@ class TaskQueue {
 
     using internal_queue_t = std::list<std::unique_ptr<TaskBase>>;
 
-    static void sleep(uint8_t &sleep_count) {
-        sleep_count = std::max(sleep_count + 1, 127);
-        if (sleep_count > 10) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50 * sleep_count));
-        }
-    }
-
-    static void thread_run(TaskQueue &task_queue, uint8_t &sleep_counter) {
-        if (task_queue.total_elements.load() == 0) {
-            sleep(sleep_counter);
+    static void thread_run(TaskQueue &task_queue) {
+        if (task_queue.empty()) {
+            std::unique_lock<std::mutex> scopedLock(task_queue.size_lock);
+            task_queue.emptyQueue.wait_for(scopedLock, std::chrono::milliseconds (1),
+                                           [&task_queue] { return task_queue.total_elements != 0; });
             return;
         }
         size_t priority = QueueDistribution<queue_size>::generate();
 
-        while ((*task_queue.sizes[priority]).load() == 0 && task_queue.total_elements.load() != 0) {
+        while ((*task_queue.sizes[priority]).load(std::memory_order_acquire) == 0 && !task_queue.empty()) {
             priority++;
             priority %= queue_size;
         }
 
-        if (task_queue.total_elements.load() == 0) {
-            sleep(sleep_counter);
+        if (task_queue.empty()) {
             return;
         }
-        sleep_counter = 0;
         if ((*task_queue.sizes[priority]) != 0) {
             std::unique_ptr<TaskBase> elem;
             {
@@ -127,7 +110,10 @@ class TaskQueue {
                 (*task_queue.sizes[priority])--;
                 elem->set_start();
             }
-            task_queue.total_elements--;
+            {
+                std::scoped_lock<std::mutex> scopedLock(task_queue.size_lock);
+                task_queue.total_elements--;
+            }
             elem->execute();
         }
     }
@@ -163,12 +149,21 @@ public:
             return res_future.get();
         }
 
+        [[nodiscard]] bool result_ready() {
+            auto result_status = res_future.wait_for(std::chrono::microseconds(0));
+            return result_status == std::future_status::ready;
+        }
+
         [[nodiscard]] size_t get_priority() const {
             return priority;
         }
 
         [[nodiscard]] bool is_started() const {
             return task_taken_future->load(std::memory_order_acquire);
+        }
+
+        [[nodiscard]] bool is_valid() {
+            return !expired;
         }
 
     private:
@@ -191,9 +186,9 @@ private:
     }
 
 public:
-    explicit TaskQueue(uint32_t thread_count) : sleep_counter(thread_count, 0), sizes(gen_counters()),
-                                                pool([this](PoolDispatcher::thread_id_t t_id) {
-                                                    thread_run(*this, sleep_counter[t_id]);
+    explicit TaskQueue(uint32_t thread_count) : sizes(gen_counters()),
+                                                pool([this]() {
+                                                    thread_run(*this);
                                                 }, thread_count) {
     }
 
@@ -210,7 +205,11 @@ public:
             handler.iterator = queues[priority].begin();
             (*sizes[priority])++;
         }
-        total_elements++;
+        {
+            std::scoped_lock<std::mutex> scopedLock(size_lock);
+            total_elements++;
+        }
+        emptyQueue.notify_one();
         return handler;
     }
 
@@ -283,7 +282,7 @@ public:
     }
 
     bool empty() {
-        return total_elements == 0;
+        return total_elements.load(std::memory_order_acquire) == 0;
     }
 
     TaskQueue(TaskQueue const &) = delete;
@@ -292,8 +291,9 @@ public:
 
 private:
     std::atomic_size_t total_elements{};
+    std::mutex size_lock;
     std::array<internal_queue_t, queue_size> queues;
-    std::vector<uint8_t> sleep_counter;
+    std::condition_variable emptyQueue;
     std::array<std::unique_ptr<std::atomic_size_t>, queue_size> sizes;
     std::array<std::mutex, queue_size> queues_mutexes;
     PoolDispatcher pool;
