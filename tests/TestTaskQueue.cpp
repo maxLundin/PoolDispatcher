@@ -9,6 +9,8 @@
 #include "TaskQueue.h"
 
 
+using namespace JBPool;
+
 /*
  * probability based test
  * may fail
